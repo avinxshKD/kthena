@@ -37,6 +37,7 @@ func TestSchedulerPluginKVCacheAware(t *testing.T) {
 	t.Cleanup(redisCleanup)
 
 	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	redisClient := setupKVCacheRedisClient(t, kthenaNamespace)
 	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
 
 	chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerKVCacheAware, kvCacheFixtureDeploymentName, plugincontext.ModelName)
@@ -45,7 +46,7 @@ func TestSchedulerPluginKVCacheAware(t *testing.T) {
 	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
 	prompt := "kthena kvcache routing test"
 	warmedPod := pods[0]
-	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
+	waitForKVCacheOwnership(t, warmedPod, redisClient, route.Spec.ModelName, prompt)
 
 	hitSince := metav1.NewTime(time.Now())
 	utils.SendRouterChatRequests(t, chatURL, route.Spec.ModelName, prompt, kvCacheRoutingRequestCount)
@@ -81,6 +82,100 @@ func TestSchedulerPluginKVCacheAware(t *testing.T) {
 	waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
 }
 
+// TestSchedulerPluginKVCacheAwareLifecycle verifies prefix depth and cache lifecycle events affect replica selection.
+func TestSchedulerPluginKVCacheAwareLifecycle(t *testing.T) {
+	ctx := context.Background()
+	redisCleanup := ensureRedis(t, testCtx.KubeClient, kthenaNamespace)
+	t.Cleanup(redisCleanup)
+
+	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	redisClient := setupKVCacheRedisClient(t, kthenaNamespace)
+	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
+
+	chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerKVCacheAware, kvCacheFixtureDeploymentName, plugincontext.ModelName)
+	t.Cleanup(restoreCfg)
+
+	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
+	shortPrompt := "phase four alpha beta"
+	longPrompt := shortPrompt + " gamma delta epsilon zeta eta theta iota"
+	shortHashes := kvCachePromptHashes(t, pods[0], route.Spec.ModelName, shortPrompt)
+	longHashes := kvCachePromptHashes(t, pods[0], route.Spec.ModelName, longPrompt)
+	sharedBlocks := 0
+	for sharedBlocks < len(shortHashes) && sharedBlocks < len(longHashes) && shortHashes[sharedBlocks] == longHashes[sharedBlocks] {
+		sharedBlocks++
+	}
+	require.GreaterOrEqual(t, sharedBlocks, 1, "prompts must share at least one complete block")
+	require.Less(t, sharedBlocks, len(longHashes), "long prompt needs an additional complete block")
+
+	shortPrefixPod := pods[0]
+	longPrefixPod := pods[1]
+	coldPod := pods[2]
+	waitForKVCacheOwnership(t, shortPrefixPod, redisClient, route.Spec.ModelName, shortPrompt)
+	longOwnership := waitForKVCacheHashOwnership(t, longPrefixPod, redisClient, route.Spec.ModelName, longPrompt, longHashes[sharedBlocks])
+	messages := []utils.ChatMessage{utils.NewChatMessage("user", longPrompt)}
+	selectedPod := utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+	require.Equal(t, longPrefixPod.Name, selectedPod)
+
+	inconsistentPrompt := "inconsistent redis violet quartz cedar maple silver copper amber indigo"
+	inconsistentHashes := kvCachePromptHashes(t, coldPod, route.Spec.ModelName, inconsistentPrompt)
+	inconsistentOwnership := waitForKVCacheHashOwnership(t, coldPod, redisClient, route.Spec.ModelName, inconsistentPrompt, inconsistentHashes[len(inconsistentHashes)-1])
+	redisCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	deleted, err := redisClient.Del(redisCtx, inconsistentOwnership.mappingKey).Result()
+	cancel()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, deleted, "delete Runtime mapping for inconsistent-state check")
+	inconsistentMessages := []utils.ChatMessage{utils.NewChatMessage("user", inconsistentPrompt)}
+	selectedPod = utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, inconsistentMessages, nil)
+	require.Equal(t, coldPod.Name, selectedPod, "Router scoring should use the ownership matrix")
+
+	for i := 0; i < 12; i++ {
+		evictionPrompt := fmt.Sprintf("phase four eviction %02d unique alpha beta gamma delta epsilon zeta", i)
+		utils.DirectChatToPod(t, longPrefixPod, route.Spec.ModelName, evictionPrompt, 1)
+	}
+	waitForKVCacheOwnershipRemoved(t, redisClient, longOwnership)
+	waitForKVCacheHashOwnership(t, coldPod, redisClient, route.Spec.ModelName, longPrompt, longHashes[sharedBlocks])
+	selectedPod = utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+	require.Equal(t, coldPod.Name, selectedPod)
+
+	postKVCacheLifecycle(t, coldPod, "/sleep")
+	waitForAllKVCacheOwnershipRemoved(t, redisClient, coldPod, route.Spec.ModelName)
+	postKVCacheLifecycle(t, coldPod, "/wake_up")
+	waitForKVCacheHashOwnership(t, shortPrefixPod, redisClient, route.Spec.ModelName, longPrompt, longHashes[sharedBlocks])
+	selectedPod = utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+	require.Equal(t, shortPrefixPod.Name, selectedPod)
+
+	staleOwnership := waitForKVCacheHashOwnership(t, coldPod, redisClient, route.Spec.ModelName, longPrompt, longHashes[sharedBlocks])
+	zero := int64(0)
+	err = testCtx.KubeClient.CoreV1().Pods(coldPod.Namespace).Delete(ctx, coldPod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	require.NoError(t, err, "delete warmed simulator Pod")
+	require.Eventually(t, func() bool {
+		podList, err := testCtx.KubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + kvCacheFixtureAppLabel})
+		if err != nil {
+			return false
+		}
+		ready := 0
+		for _, pod := range podList.Items {
+			if pod.Name == coldPod.Name {
+				return false
+			}
+			if utils.IsPodReady(pod) {
+				ready++
+			}
+		}
+		return ready == pluginMockReplicaCount
+	}, 5*time.Minute, 2*time.Second, "KV-cache fixture did not replace %s", coldPod.Name)
+
+	redisCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	staleOwnerExists, err := redisClient.HExists(redisCtx, staleOwnership.ownershipKey, staleOwnership.owner).Result()
+	cancel()
+	require.NoError(t, err)
+	require.True(t, staleOwnerExists, "abrupt Pod deletion should leave stale ownership for this check")
+	selectedPod = utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+	require.Equal(t, shortPrefixPod.Name, selectedPod, "stale ownership from a deleted Pod must not affect selection")
+
+	waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
+}
+
 // TestSchedulerPluginMixedWeights verifies plugin weights decide the winner when score plugins disagree.
 func TestSchedulerPluginMixedWeights(t *testing.T) {
 	ctx := context.Background()
@@ -88,6 +183,7 @@ func TestSchedulerPluginMixedWeights(t *testing.T) {
 	t.Cleanup(redisCleanup)
 
 	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	redisClient := setupKVCacheRedisClient(t, kthenaNamespace)
 	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
 	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
 	prompt := "kthena kvcache routing test"
@@ -96,7 +192,7 @@ func TestSchedulerPluginMixedWeights(t *testing.T) {
 	coldPod := pods[2]
 	hotPods := []corev1.Pod{warmedPod, otherHotPod}
 	coldPods := []corev1.Pod{coldPod}
-	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
+	waitForKVCacheOwnership(t, warmedPod, redisClient, route.Spec.ModelName, prompt)
 	stopWarmedLoad := utils.StartSustainedLongRequestsToPod(t, warmedPod, route.Spec.ModelName, prompt, gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)
 	t.Cleanup(stopWarmedLoad)
 	stopOtherLoad := utils.StartSustainedLongRequestsToPod(t, otherHotPod, route.Spec.ModelName, "unrelated gpu load prompt", gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)

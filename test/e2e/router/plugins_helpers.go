@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -58,6 +59,12 @@ const (
 	kvCacheRoutingRequestCount     = 200
 	mixedPluginDominantWeight      = 101 // one more than either plugin's maximum score
 )
+
+type kvCacheOwnership struct {
+	mappingKey   string
+	ownershipKey string
+	owner        string
+}
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
 	t.Helper()
@@ -98,7 +105,21 @@ func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, red
 	return pods
 }
 
-func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model, prompt string) {
+func setupKVCacheRedisClient(t *testing.T, redisNamespace string) *redis.Client {
+	t.Helper()
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForward(redisNamespace, "redis-server", localPort, "6379")
+	require.NoError(t, err, "port-forward to Redis")
+
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:" + localPort})
+	t.Cleanup(func() {
+		_ = client.Close()
+		pf.Close()
+	})
+	return client
+}
+
+func kvCachePromptHashes(t *testing.T, pod corev1.Pod, model, prompt string) []string {
 	t.Helper()
 	tokenizerPort := utils.AllocateLocalPort(t)
 	tokenizerPF, err := utils.SetupPortForwardToPod(pod.Namespace, pod.Name, tokenizerPort, "8000")
@@ -124,21 +145,25 @@ func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model
 	require.NoError(t, err, "tokenize KV-cache prompt")
 	require.GreaterOrEqual(t, len(result.Tokens), kvCacheBlockSize, "KV-cache prompt must contain a complete block")
 
-	tokenBytes := make([]byte, kvCacheBlockSize*4)
-	for i, tokenID := range result.Tokens[:kvCacheBlockSize] {
-		binary.BigEndian.PutUint32(tokenBytes[i*4:], uint32(tokenID))
+	hashes := make([]string, 0, len(result.Tokens)/kvCacheBlockSize)
+	for start := 0; start+kvCacheBlockSize <= len(result.Tokens); start += kvCacheBlockSize {
+		tokenBytes := make([]byte, kvCacheBlockSize*4)
+		for i, tokenID := range result.Tokens[start : start+kvCacheBlockSize] {
+			binary.BigEndian.PutUint32(tokenBytes[i*4:], uint32(tokenID))
+		}
+		sum := sha256.Sum256(tokenBytes)
+		hashes = append(hashes, fmt.Sprintf("%d", binary.BigEndian.Uint64(sum[:8])&0x7FFFFFFFFFFFFFFF))
 	}
-	sum := sha256.Sum256(tokenBytes)
-	expectedHash := fmt.Sprintf("%d", binary.BigEndian.Uint64(sum[:8])&0x7FFFFFFFFFFFFFFF)
+	return hashes
+}
 
-	localPort := utils.AllocateLocalPort(t)
-	pf, err := utils.SetupPortForward(redisNamespace, "redis-server", localPort, "6379")
-	require.NoError(t, err, "port-forward to Redis")
-	defer pf.Close()
+func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, client *redis.Client, model, prompt string) kvCacheOwnership {
+	t.Helper()
+	return waitForKVCacheHashOwnership(t, pod, client, model, prompt, kvCachePromptHashes(t, pod, model, prompt)[0])
+}
 
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:" + localPort})
-	defer client.Close()
-
+func waitForKVCacheHashOwnership(t *testing.T, pod corev1.Pod, client *redis.Client, model, prompt, expectedHash string) kvCacheOwnership {
+	t.Helper()
 	owner := pod.Name + "." + pod.Namespace
 	mappingPattern := fmt.Sprintf("%s:%s@*", kvCacheMappingPrefix, owner)
 	var observedMappings map[string]string
@@ -167,7 +192,7 @@ func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model
 			exists, err := client.HExists(ctx, ownershipKey, owner).Result()
 			if err == nil && exists {
 				cancel()
-				return
+				return kvCacheOwnership{mappingKey: mappingKey, ownershipKey: ownershipKey, owner: owner}
 			} else if err != nil {
 				lastRedisErr = err
 			}
@@ -181,6 +206,88 @@ func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model
 	require.FailNowf(t, "KV-cache ownership not found",
 		"owner=%s expected standardized hash=%s observed engine mappings=%v last Redis error=%v",
 		owner, expectedHash, observedMappings, lastRedisErr)
+	return kvCacheOwnership{}
+}
+
+func waitForKVCacheOwnershipRemoved(t *testing.T, client *redis.Client, ownership kvCacheOwnership) {
+	t.Helper()
+	var mappingExists int64
+	var ownerExists bool
+	var lastRedisErr error
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		mappingExists, lastRedisErr = client.Exists(ctx, ownership.mappingKey).Result()
+		if lastRedisErr != nil {
+			return false
+		}
+		ownerExists, lastRedisErr = client.HExists(ctx, ownership.ownershipKey, ownership.owner).Result()
+		return lastRedisErr == nil && mappingExists == 0 && !ownerExists
+	}, kvCacheOwnershipWaitTimeout, time.Second,
+		"KV-cache ownership was not removed: mapping=%s exists=%d ownership=%s owner=%s exists=%t last Redis error=%v",
+		ownership.mappingKey, mappingExists, ownership.ownershipKey, ownership.owner, ownerExists, lastRedisErr)
+}
+
+func scanKVCacheKeys(ctx context.Context, client *redis.Client, pattern string) ([]string, error) {
+	var keys []string
+	iter := client.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	return keys, iter.Err()
+}
+
+func waitForAllKVCacheOwnershipRemoved(t *testing.T, client *redis.Client, pod corev1.Pod, model string) {
+	t.Helper()
+	owner := pod.Name + "." + pod.Namespace
+	mappingPattern := fmt.Sprintf("%s:%s@*", kvCacheMappingPrefix, owner)
+	ownershipPattern := fmt.Sprintf("%s:%s@*", kvCacheOwnershipPrefix, model)
+	var mappingKeys, ownedKeys []string
+	var lastRedisErr error
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		mappingKeys, lastRedisErr = scanKVCacheKeys(ctx, client, mappingPattern)
+		if lastRedisErr != nil {
+			return false
+		}
+		ownedKeys = ownedKeys[:0]
+		keys, err := scanKVCacheKeys(ctx, client, ownershipPattern)
+		if err != nil {
+			lastRedisErr = err
+			return false
+		}
+		for _, key := range keys {
+			exists, err := client.HExists(ctx, key, owner).Result()
+			if err != nil {
+				lastRedisErr = err
+				return false
+			}
+			if exists {
+				ownedKeys = append(ownedKeys, key)
+			}
+		}
+		return len(mappingKeys) == 0 && len(ownedKeys) == 0
+	}, kvCacheOwnershipWaitTimeout, time.Second,
+		"KV-cache state was not cleared: owner=%s mappings=%v ownership=%v last Redis error=%v",
+		owner, mappingKeys, ownedKeys, lastRedisErr)
+}
+
+func postKVCacheLifecycle(t *testing.T, pod corev1.Pod, path string) {
+	t.Helper()
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForwardToPod(pod.Namespace, pod.Name, localPort, "8000")
+	require.NoError(t, err, "port-forward to KV-cache simulator")
+	defer pf.Close()
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%s%s", localPort, path), nil)
+	require.NoError(t, err)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
 }
 
 func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, pluginType string) {
