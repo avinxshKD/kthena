@@ -50,8 +50,8 @@ const (
 	gpuCacheUsageLoadWaitTimeout   = 90 * time.Second
 	gpuCacheUsageLoadConcurrency   = 2
 	gpuCacheUsageLoadMaxTokens     = 256
-	kvCacheFixtureDeploymentName   = "router-plugin-kvcache-mock"
-	kvCacheFixtureAppLabel         = kvCacheFixtureDeploymentName
+	kvCacheFixtureName             = "router-plugin-kvcache-mock"
+	kvCacheFixtureAppLabel         = kvCacheFixtureName
 	kvCacheOwnershipWaitTimeout    = 90 * time.Second
 	kvCacheMappingPrefix           = "vllm:kv:block"
 	kvCacheOwnershipPrefix         = "matrix:kv:block"
@@ -76,11 +76,11 @@ func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string
 func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, redisNamespace string) []corev1.Pod {
 	t.Helper()
 	ctx := context.Background()
-	deployment := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-kvcache.yaml"))
-	deployment.Namespace = namespace
+	statefulSet := utils.LoadYAMLFromFile[appsv1.StatefulSet](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-kvcache.yaml"))
+	statefulSet.Namespace = namespace
 	redisHostSet := false
-	for i := range deployment.Spec.Template.Spec.Containers {
-		container := &deployment.Spec.Template.Spec.Containers[i]
+	for i := range statefulSet.Spec.Template.Spec.Containers {
+		container := &statefulSet.Spec.Template.Spec.Containers[i]
 		if container.Name != "kthena-runtime" {
 			continue
 		}
@@ -93,13 +93,21 @@ func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, red
 	}
 	require.True(t, redisHostSet, "KV-cache fixture Runtime needs REDIS_HOST")
 
-	_, err := kube.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
+	_, err := kube.AppsV1().StatefulSets(namespace).Create(ctx, statefulSet, metav1.CreateOptions{})
 	require.NoError(t, err, "create KV-cache fixture")
 	t.Cleanup(func() {
-		utils.DeleteDeploymentAndWait(t, kube, namespace, kvCacheFixtureDeploymentName, 2*time.Minute)
+		foreground := metav1.DeletePropagationForeground
+		_ = kube.AppsV1().StatefulSets(namespace).Delete(context.Background(), kvCacheFixtureName, metav1.DeleteOptions{PropagationPolicy: &foreground})
+		require.Eventually(t, func() bool {
+			pods, err := kube.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: "app=" + kvCacheFixtureAppLabel})
+			return err == nil && len(pods.Items) == 0
+		}, 2*time.Minute, time.Second, "KV-cache fixture pods should be deleted")
 	})
 
-	utils.WaitForDeploymentReady(t, ctx, kube, namespace, kvCacheFixtureDeploymentName, pluginMockReplicaCount, 5*time.Minute)
+	require.Eventually(t, func() bool {
+		current, err := kube.AppsV1().StatefulSets(namespace).Get(ctx, kvCacheFixtureName, metav1.GetOptions{})
+		return err == nil && current.Status.ReadyReplicas == pluginMockReplicaCount
+	}, 5*time.Minute, time.Second, "KV-cache fixture should have %d ready pods", pluginMockReplicaCount)
 	pods := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+kvCacheFixtureAppLabel)
 	require.Len(t, pods, pluginMockReplicaCount, "KV-cache fixture needs %d mock pods", pluginMockReplicaCount)
 	return pods
